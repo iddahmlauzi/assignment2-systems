@@ -1,28 +1,36 @@
-from __future__ import annotations
-
-import numpy as np
-import numpy.typing as npt
 import torch
+import jaxtyping
+from torch import Tensor
+import numpy.typing as npt
+import numpy as np
 
 
 def get_batch(
     dataset: npt.NDArray, batch_size: int, context_length: int, device: str
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    starting_idxs = torch.randint(len(dataset) - context_length, (batch_size,))
-    x = torch.stack([
-            torch.from_numpy((dataset[i : i + context_length]).astype(np.int64))
-            for i in starting_idxs
-    ])  # fmt: skip
-    y = torch.stack(
-        [
-            torch.from_numpy((dataset[i + 1 : i + 1 + context_length]).astype(np.int64))
-            for i in starting_idxs
-        ]
-    )  # fmt: skip
-    if "cuda" in device:
-        x = x.pin_memory().to(device, non_blocking=True)
-        y = y.pin_memory().to(device, non_blocking=True)
-    else:
-        x = x.to(device)
-        y = y.to(device)
-    return x, y
+    """
+    Given a dataset (a 1D numpy array of integers) and a desired batch size and
+    context length, sample language modeling input sequences and their corresponding
+    labels from the dataset.
+    """
+    
+    # Sample indices from [0 up to n - m]
+    n = dataset.size  # (batch_size, context_length)
+    start_indices = np.random.randint(low=0, high= n - context_length, size=batch_size)  # (batch_size, )
+    offsets = np.arange(start=0, stop=context_length) # (context_len,)
+    
+    start_indices = np.expand_dims(start_indices, 1) # (batch_size, 1)
+    offsets = np.expand_dims(offsets, 0) # (1, context_len)
+    all_indices = start_indices + offsets # (batch_size, context_len)
+    
+    inputs, targets = dataset[all_indices], dataset[all_indices + 1]
+    inputs =  torch.as_tensor(inputs, device=device, dtype=torch.long)
+    targets = torch.as_tensor(targets, device=device, dtype=torch.long)
+    
+    return inputs, targets
+    
+    
+    
+    
+    
+    
