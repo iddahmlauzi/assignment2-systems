@@ -1,11 +1,171 @@
 import einx
 import torch 
 import math
+import triton
+import triton.language as tl
 from jaxtyping import Float
 from torch import Tensor
 
-Q_TILE_SIZE = 32
-K_TILE_SIZE = 32
+PYTORCH_Q_TILE_SIZE = 32
+PYTORCH_K_TILE_SIZE = 32
+
+@triton.jit
+def flash_fwd_kernel(
+    Q_ptr, K_ptr, V_ptr,
+    O_ptr, L_ptr,
+    stride_qb, stride_qq, stride_qd,
+    stride_kb, stride_kk, stride_kd,
+    stride_vb, stride_vk, stride_vd,
+    stride_ob, stride_oq, stride_od,
+    stride_lb, stride_lq,
+    N_QUERIES, N_KEYS,
+    scale,
+    D: tl.constexpr,
+    Q_TILE_SIZE: tl.constexpr,
+    K_TILE_SIZE: tl.constexpr,
+    is_causal: tl.constexpr
+    ):
+    # Program indices
+    query_tile_index = tl.program_id(0)
+    batch_index = tl.program_id(1)
+    # Offset each pointer with the corresponding batch index
+    # multiplied with the batch stride for each tensor
+    Q_block_ptr = tl.make_block_ptr(
+        Q_ptr + batch_index * stride_qb,
+        shape=(N_QUERIES, D),
+        strides=(stride_qq, stride_qd),
+        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    
+    K_block_ptr = tl.make_block_ptr(
+        K_ptr + batch_index * stride_kb,
+        shape=(N_KEYS, D),
+        strides=(stride_kk, stride_kd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    
+    V_block_ptr = tl.make_block_ptr(
+        V_ptr + batch_index * stride_vb,
+        shape=(N_KEYS, D),
+        strides=(stride_vk, stride_vd),
+        offsets=(0, 0),
+        block_shape=(K_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    
+    O_block_ptr = tl.make_block_ptr(
+        O_ptr + batch_index * stride_ob,
+        shape=(N_QUERIES, D),
+        strides=(stride_oq, stride_od),
+        offsets=(query_tile_index * Q_TILE_SIZE, 0),
+        block_shape=(Q_TILE_SIZE, D),
+        order=(1, 0),
+    )
+    
+    L_block_ptr = tl.make_block_ptr(
+        L_ptr + batch_index * stride_lb,
+        shape=(N_QUERIES,),
+        strides=(stride_lq,),
+        offsets=(query_tile_index * Q_TILE_SIZE),
+        block_shape=(Q_TILE_SIZE,),
+        order=(0,),
+    )
+    
+    # Initialize buffers to write to
+    O = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
+    L = tl.zeros((Q_TILE_SIZE,), dtype=tl.float32)
+    M = tl.full((Q_TILE_SIZE,), value=float("-inf"), dtype=tl.float32)
+    
+    Q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero") # (Q_TILE_SIZE, D)
+    
+    q_indices = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+    
+    for i in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+        K = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
+        V = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
+        
+        S = tl.dot(Q, tl.trans(K)) * scale # (Q_TILE_SIZE, K_TILE_SIZE)
+        
+        if is_causal:
+            k_indices = i * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+            mask = q_indices[:, None] < k_indices[None, :]  # (Q_TILE_SIZE, K_TILE_SIZE)
+            S = tl.where(mask, S + -1e6, S)
+        rowmax = tl.max(S, axis=1)        # (Q_TILE_SIZE,)
+        m_new = tl.maximum(M, rowmax)      # (Q_TILE_SIZE,)
+        
+        P = tl.exp(S - m_new[:, None])                    # (Q_TILE_SIZE, K_TILE_SIZE)
+        correction_factor = tl.exp(M - m_new)             # (Q_TILE_SIZE,)
+        L = correction_factor * L + tl.sum(P, axis=1)    # (Q_TILE_SIZE,)
+        O = correction_factor[:, None] * O
+        O = tl.dot(P.to(V.dtype), V, acc=O)               # (Q_TILE_SIZE, D)
+        
+        M = m_new
+        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+    
+    
+    # Normalize the final output
+    O = O / L[:, None]
+    L = M + tl.log(L)
+    
+    # Write the final outputs
+    O_dtype = O_block_ptr.type.element_ty
+    tl.store(O_block_ptr, O.to(O_dtype), boundary_check=(0, 1))
+    tl.store(L_block_ptr, L, boundary_check=(0,))
+    
+    
+class FlashAttentionTriton(torch.autograd.Function):
+    
+    @staticmethod
+    def forward(ctx,
+            Q: Float[Tensor, " ... queries d_k"],
+            K: Float[Tensor, " ... keys d_k"],
+            V: Float[Tensor, " ... keys d_v"],
+            is_causal: bool=False,
+            ):
+
+        batch_size, n_queries, d = Q.shape
+        n_keys = K.shape[-2]
+        scale = 1 / math.sqrt(d)
+        
+        device = Q.device
+        
+        ctx.Q_TILE_SIZE = 16
+        ctx.K_TILE_SIZE = 16
+        ctx.D = d
+        ctx.is_causal = is_causal
+        
+        O = torch.empty((batch_size, n_queries, d), device=device, dtype=Q.dtype)
+        L = torch.empty((batch_size, n_queries), device=device, dtype=torch.float32)  
+        
+        flash_fwd_kernel[(triton.cdiv(n_queries, ctx.Q_TILE_SIZE), batch_size)](
+            Q, K, V, 
+            O, L,
+            Q.stride(0), Q.stride(1), Q.stride(2),
+            K.stride(0), K.stride(1), K.stride(2),
+            V.stride(0), V.stride(1), V.stride(2),
+            O.stride(0), O.stride(1), O.stride(2),
+            L.stride(0), L.stride(1),
+            n_queries, n_keys,
+            scale,
+            ctx.D,
+            ctx.Q_TILE_SIZE, ctx.K_TILE_SIZE,
+            ctx.is_causal
+        )
+    
+        ctx.save_for_backward(L, Q, K, V, O)
+        
+        return O
+    
+    
+    @staticmethod
+    def backward(ctx, grad_out):
+        raise NotImplementedError("We have not implemented this yet")
+    
 
 class FlashAttentionPytorch(torch.autograd.Function):
     
@@ -25,17 +185,17 @@ class FlashAttentionPytorch(torch.autograd.Function):
         L = torch.zeros(Q.shape[:-1], device=device)                            # softmax denominator
         M = torch.full(Q.shape[:-1], fill_value=-float("inf"), device=device)   # row maximum
         
-        for i in range(math.ceil(N / Q_TILE_SIZE)):
+        for i in range(math.ceil(N / PYTORCH_Q_TILE_SIZE)):
             # Load block from Q
-            Q_i = Q[..., i * Q_TILE_SIZE: (i + 1) * Q_TILE_SIZE, :]    # (..., q_tile_size, d_k)
-            o_prev = O[..., i * Q_TILE_SIZE: (i + 1) * Q_TILE_SIZE, :] # (..., q_tile_size, d_v)
-            l_prev = L[..., i * Q_TILE_SIZE: (i + 1) * Q_TILE_SIZE]    # (..., q_tile_size)
-            m_prev = M[..., i * Q_TILE_SIZE: (i + 1) * Q_TILE_SIZE]    # (..., q_tile_size)
+            Q_i = Q[..., i * PYTORCH_Q_TILE_SIZE: (i + 1) * PYTORCH_Q_TILE_SIZE, :]    # (..., q_tile_size, d_k)
+            o_prev = O[..., i * PYTORCH_Q_TILE_SIZE: (i + 1) * PYTORCH_Q_TILE_SIZE, :] # (..., q_tile_size, d_v)
+            l_prev = L[..., i * PYTORCH_Q_TILE_SIZE: (i + 1) * PYTORCH_Q_TILE_SIZE]    # (..., q_tile_size)
+            m_prev = M[..., i * PYTORCH_Q_TILE_SIZE: (i + 1) * PYTORCH_Q_TILE_SIZE]    # (..., q_tile_size)
             
      
-            for j in range(math.ceil(N / K_TILE_SIZE)):
-                K_j = K[..., j * K_TILE_SIZE: (j + 1) * K_TILE_SIZE, :] # (..., k_tile_size, d_k)
-                V_j = V[..., j * K_TILE_SIZE: (j + 1) * K_TILE_SIZE, :] # (..., k_tile_size, d_v)
+            for j in range(math.ceil(N / PYTORCH_K_TILE_SIZE)):
+                K_j = K[..., j * PYTORCH_K_TILE_SIZE: (j + 1) * PYTORCH_K_TILE_SIZE, :] # (..., k_tile_size, d_k)
+                V_j = V[..., j * PYTORCH_K_TILE_SIZE: (j + 1) * PYTORCH_K_TILE_SIZE, :] # (..., k_tile_size, d_v)
                 
                 # Pre-Softmax Attention Scores
                 S = einx.dot("... q_tile_size [dk], ... k_tile_size [dk] -> ... q_tile_size k_tile_size", Q_i, K_j) / math.sqrt(d_k)
@@ -49,9 +209,9 @@ class FlashAttentionPytorch(torch.autograd.Function):
                 
                 m_prev = m_new
                 
-            O[..., i * Q_TILE_SIZE: (i + 1) * Q_TILE_SIZE, :] = o_prev
-            L[..., i * Q_TILE_SIZE: (i + 1) * Q_TILE_SIZE] = l_prev
-            M[..., i * Q_TILE_SIZE: (i + 1) * Q_TILE_SIZE] = m_prev
+            O[..., i * PYTORCH_Q_TILE_SIZE: (i + 1) * PYTORCH_Q_TILE_SIZE, :] = o_prev
+            L[..., i * PYTORCH_Q_TILE_SIZE: (i + 1) * PYTORCH_Q_TILE_SIZE] = l_prev
+            M[..., i * PYTORCH_Q_TILE_SIZE: (i + 1) * PYTORCH_Q_TILE_SIZE] = m_prev
             
                 
         # Normalize the final output
@@ -65,6 +225,9 @@ class FlashAttentionPytorch(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out):
         raise NotImplementedError("We have not implemented this yet")
+    
+    
+
     
     
     
