@@ -94,14 +94,14 @@ def flash_fwd_kernel(
             k_indices = i * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
             mask = q_indices[:, None] < k_indices[None, :]  # (Q_TILE_SIZE, K_TILE_SIZE)
             S = tl.where(mask, S + -1e6, S)
-        rowmax = tl.max(S, axis=1)        # (Q_TILE_SIZE,)
-        m_new = tl.maximum(M, rowmax)      # (Q_TILE_SIZE,)
+        rowmax = tl.max(S, axis=1)                          # (Q_TILE_SIZE,)
+        m_new = tl.maximum(M, rowmax)                       # (Q_TILE_SIZE,)
         
-        P = tl.exp(S - m_new[:, None])                    # (Q_TILE_SIZE, K_TILE_SIZE)
-        correction_factor = tl.exp(M - m_new)             # (Q_TILE_SIZE,)
-        L = correction_factor * L + tl.sum(P, axis=1)    # (Q_TILE_SIZE,)
+        P = tl.exp(S - m_new[:, None])                      # (Q_TILE_SIZE, K_TILE_SIZE)
+        correction_factor = tl.exp(M - m_new)               # (Q_TILE_SIZE,)
+        L = correction_factor * L + tl.sum(P, axis=1)       # (Q_TILE_SIZE,)
         O = correction_factor[:, None] * O
-        O = tl.dot(P.to(V.dtype), V, acc=O)               # (Q_TILE_SIZE, D)
+        O = tl.dot(P.to(V.dtype), V, acc=O)                 # (Q_TILE_SIZE, D)
         
         M = m_new
         K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
@@ -116,6 +116,37 @@ def flash_fwd_kernel(
     O_dtype = O_block_ptr.type.element_ty
     tl.store(O_block_ptr, O.to(O_dtype), boundary_check=(0, 1))
     tl.store(L_block_ptr, L, boundary_check=(0,))
+    
+    
+def flash_bwd_pytorch(
+            Q: Float[Tensor, " ... queries d_k"],
+            K: Float[Tensor, " ... keys d_k"],
+            V: Float[Tensor, " ... keys d_v"],
+            O: Float[Tensor, " ... queries d_v"],
+            dO: Float[Tensor, " ... queries d_v"],
+            L: Float[Tensor, " ... queries"],
+            is_causal: bool=False,
+            ):
+    _, n_queries, d = Q.shape
+    n_keys = K.shape[-2]
+    scale = 1 / math.sqrt(d)
+    
+    D = torch.sum(O * dO, dim=-1) # (batch, queries)
+    S = einx.dot("... queries [d_k], ... keys [d_k] -> ... queries keys", Q, K) * scale
+    if is_causal:
+        mask = torch.tril(torch.ones(n_queries, n_keys, device=Q.device, dtype=torch.bool))
+        S.masked_fill_(~mask, -float("inf"))
+    
+    P = torch.exp(S - L.unsqueeze(-1)).to(Q.dtype) # (batch, queries, keys)
+    
+    dV = einx.dot("... [queries] keys, ... [queries] d_v -> ... keys d_v", P, dO)
+    dP = einx.dot("... queries [d_v], ... keys [d_v] -> ... queries keys", dO, V)
+    dS = P * (dP - D.unsqueeze(-1)) # (batch, queries, keys)
+    dQ = einx.dot("... queries [keys],  ... [keys] d_k -> ... queries d_k", dS, K) * scale
+    dK = einx.dot("... [queries] keys, ... [queries] d_k ->  ... keys d_k", dS, Q) * scale
+    
+    return dQ, dK, dV
+    
     
     
 class FlashAttentionTriton(torch.autograd.Function):
@@ -157,14 +188,18 @@ class FlashAttentionTriton(torch.autograd.Function):
             ctx.is_causal
         )
     
-        ctx.save_for_backward(L, Q, K, V, O)
+        ctx.save_for_backward(Q, K, V, L, O)
         
         return O
     
     
     @staticmethod
     def backward(ctx, grad_out):
-        raise NotImplementedError("We have not implemented this yet")
+        Q, K, V, L, O = ctx.saved_tensors
+        dQ, dK, dV = flash_bwd_pytorch(
+            Q, K, V, O, grad_out, L, ctx.is_causal
+        )
+        return dQ, dK, dV, None
     
 
 class FlashAttentionPytorch(torch.autograd.Function):
@@ -218,13 +253,18 @@ class FlashAttentionPytorch(torch.autograd.Function):
         O = O / L.unsqueeze(-1)
         L = M + torch.log(L)
         
-        ctx.save_for_backward(L, Q, K, V, O)
+        ctx.save_for_backward(Q, K, V, L, O)
+        ctx.is_causal = is_causal
         
         return O
     
     @staticmethod
     def backward(ctx, grad_out):
-        raise NotImplementedError("We have not implemented this yet")
+        Q, K, V, L, O = ctx.saved_tensors
+        dQ, dK, dV = flash_bwd_pytorch(
+            Q, K, V, O, grad_out, L, ctx.is_causal
+        )
+        return dQ, dK, dV, None
     
     
 

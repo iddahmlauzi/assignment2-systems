@@ -37,12 +37,16 @@ def scaled_dot_product_attention(Q: Float[Tensor, " ... queries d_k"],
                        ) -> Float[Tensor, " ... queries d_v"]:
     
     d_k = Q.shape[-1]
+    n_queries = Q.shape[-2]
+    n_keys = K.shape[-2]
     
     with nvtx.range("computing attention scores"):
         attn = einx.dot("... queries [d_k], ... keys [d_k] -> ... queries keys", Q, K) / math.sqrt(d_k)
         
     with nvtx.range("causal masking"):
         # The mask is True where we want to attend --> so we need to invert it so it is True where we do not want
+        if mask is None:
+            mask = torch.tril(torch.ones(n_queries, n_keys, device=Q.device, dtype=torch.bool))
         attn.masked_fill_(~mask, -float("inf"))
         
         # Add logit softcapping: https://arxiv.org/pdf/2408.00118 
