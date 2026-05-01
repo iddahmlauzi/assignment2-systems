@@ -24,7 +24,7 @@ class ToyFSDPModel(nn.Module):
 
     def __init__(self, vocab_size=100, d_model=64, d_ff=128):
         super().__init__()
-        from cs336_basics.model import Embedding, Linear, RMSNorm
+        from cs336_basics.layers import Embedding, Linear, RMSNorm
 
         self.embedding = Embedding(vocab_size, d_model)
         self.norm1 = RMSNorm(d_model)
@@ -50,7 +50,7 @@ def _apply_mixed_precision_hooks(model, compute_dtype):
     behavior: cast Linear/Embedding weights to compute_dtype for
     forward/backward, keep master weights and optimizer updates in fp32.
     """
-    from cs336_basics.model import Embedding, Linear
+    from cs336_basics.layers import Embedding, Linear
 
     for mod in model.modules():
         if not isinstance(mod, (Linear, Embedding)):
@@ -158,12 +158,31 @@ def _test_fsdp_correctness(rank: int, world_size: int, compute_dtype):
         offset = rank * local_bs
         local_input = all_input_ids[offset : offset + local_bs]
         local_labels = all_labels[offset : offset + local_bs]
+        # fsdp_out = fsdp_model(local_input)
+        # fsdp_loss = loss_fn(fsdp_out[:, -1, :].float(), local_labels)
         fsdp_out = fsdp_model(local_input)
+
+        if compute_dtype is not None:
+            np_local_out = non_parallel_out[offset : offset + local_bs]
+
+            out_diff = (np_local_out - fsdp_out).abs().max().item()
+
+            if rank == 0:
+                print(
+                    f"[DEBUG step={step}] output_diff={out_diff} "
+                    f"np_out_max={np_local_out.abs().max().item()} "
+                    f"fsdp_out_max={fsdp_out.abs().max().item()}",
+                    flush=True,
+                )
+
+        
         fsdp_loss = loss_fn(fsdp_out[:, -1, :].float(), local_labels)
         fsdp_loss.backward()
 
         fsdp_on_after_backward(fsdp_model, fsdp_optimizer)
+        
         fsdp_optimizer.step()
+        
 
         # Compare all parameters
         full_params = fsdp_gather_full_params(fsdp_model)
@@ -201,7 +220,7 @@ def test_fsdp_gradient_sync(compute_dtype):
 
 
 def _test_fsdp_gradient_sync(rank: int, world_size: int, compute_dtype):
-    from cs336_basics.model import Embedding, Linear
+    from cs336_basics.layers import Embedding, Linear
 
     torch.use_deterministic_algorithms(True)
     device = _setup_process_group(rank=rank, world_size=world_size, backend="gloo")
