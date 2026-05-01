@@ -21,6 +21,7 @@ class FSDP(nn.Module):
         
         self.gather_handles = {}
         self.grad_sync_handles = []
+        self.replicated_grad_sync_handles = [] # For RMSNorms 
         
         for name, param in self.module.named_parameters():
             
@@ -161,8 +162,8 @@ class FSDP(nn.Module):
             
             
     def grad_sync_hook(self, param):
-        dist.all_reduce(param.grad.data)
-        param.grad.data /= self.world_size
+        handle = dist.all_reduce(param.grad.data, async_op=True)
+        self.replicated_grad_sync_handles.append((handle, param))
            
             
     def forward(self, *inputs, **kwargs):
@@ -184,8 +185,13 @@ class FSDP(nn.Module):
         for handle, weight, shard_grad, _ in self.grad_sync_handles:
             handle.wait()
             weight.grad = shard_grad / self.world_size
-                    
+
+        for handle, param in self.replicated_grad_sync_handles:
+            handle.wait()
+            param.grad.data /= self.world_size
+                        
         self.grad_sync_handles.clear()
+        self.replicated_grad_sync_handles.clear()
         
     def get_full_params_state_dict(self) -> dict[str, torch.Tensor]:
         state_dict = {}
