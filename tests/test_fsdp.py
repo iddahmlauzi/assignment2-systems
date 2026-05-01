@@ -158,24 +158,7 @@ def _test_fsdp_correctness(rank: int, world_size: int, compute_dtype):
         offset = rank * local_bs
         local_input = all_input_ids[offset : offset + local_bs]
         local_labels = all_labels[offset : offset + local_bs]
-        # fsdp_out = fsdp_model(local_input)
-        # fsdp_loss = loss_fn(fsdp_out[:, -1, :].float(), local_labels)
         fsdp_out = fsdp_model(local_input)
-
-        if compute_dtype is not None:
-            np_local_out = non_parallel_out[offset : offset + local_bs]
-
-            out_diff = (np_local_out - fsdp_out).abs().max().item()
-
-            if rank == 0:
-                print(
-                    f"[DEBUG step={step}] output_diff={out_diff} "
-                    f"np_out_max={np_local_out.abs().max().item()} "
-                    f"fsdp_out_max={fsdp_out.abs().max().item()}",
-                    flush=True,
-                )
-
-        
         fsdp_loss = loss_fn(fsdp_out[:, -1, :].float(), local_labels)
         fsdp_loss.backward()
 
