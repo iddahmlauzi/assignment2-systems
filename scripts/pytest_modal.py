@@ -1,4 +1,4 @@
-## use similarly to regular pytest: `uv run modal run scripts/pytest_modal [pytest-args]`
+## use similarly to regular pytest: `uv run modal run scripts/pytest_modal.py [pytest-args]`
 
 from cs336_systems.modal_utils import app, build_image
 

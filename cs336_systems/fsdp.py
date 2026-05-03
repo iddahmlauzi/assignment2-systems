@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.distributed as dist
 from functools import partial
 from cs336_basics.layers import Linear, Embedding
+import torch.cuda.nvtx as nvtx
 
 
 class FSDP(nn.Module):
@@ -35,7 +36,7 @@ class FSDP(nn.Module):
                 self.original_shapes[param] = param.shape
                 
                 # Shard the parameter
-                shard = param.data.flatten().chunk(self.world_size)[self.rank].clone()
+                shard = param.data.float().flatten().chunk(self.world_size)[self.rank].clone()
                 param.data = shard
                 self.shards[param] = shard # store master weight in original data format
                 
@@ -53,7 +54,7 @@ class FSDP(nn.Module):
                 # We have the all reduce hook for it so it can still be synced
                 param.register_post_accumulate_grad_hook(self.grad_sync_hook)
             
-            
+         
     def gather_weight_for_layer(self, index):
         if index < 0 or index >= len(self.sharded_modules):
             return
@@ -66,6 +67,7 @@ class FSDP(nn.Module):
         shard = self.shards[module.weight].to(self.compute_dtype)
         
         full_weight = torch.empty(self.original_shapes[module.weight], device=shard.device, dtype=self.compute_dtype)
+         
         handle = dist.all_gather_into_tensor(full_weight.flatten(), shard, async_op=True)
         
         # Need to store the full weight so we can use it once it is all gathered
@@ -73,7 +75,10 @@ class FSDP(nn.Module):
             
 
     def pre_forward_hook(self, module, args):
-        handle, full_weight, _ = self.gather_handles.get(module.fsdp_index, None)
+        if module.fsdp_index not in self.gather_handles:
+            self.gather_weight_for_layer(module.fsdp_index)
+            
+        handle, full_weight, _ = self.gather_handles[module.fsdp_index]
         handle.wait()
         module.weight.data = full_weight # in compute dytpe
         
@@ -93,6 +98,8 @@ class FSDP(nn.Module):
         
             
     def pre_backward_hook(self, module, grad_output):
+        if module.fsdp_index not in self.gather_handles:
+            self.gather_weight_for_layer(module.fsdp_index)
         handle, full_weight, _ = self.gather_handles[module.fsdp_index]
         handle.wait()
         module.weight.data = full_weight

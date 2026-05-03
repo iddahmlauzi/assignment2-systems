@@ -98,8 +98,6 @@ class AdamW(torch.optim.Optimizer):
             beta1, beta2 = group["betas"]
             eps = group["eps"]
             weight_decay = group["weight_decay"]
-            device = group["device"]
-            dtype = group["dtype"]
             
             for p in group["params"]:
                 if p.grad is None:
@@ -111,8 +109,8 @@ class AdamW(torch.optim.Optimizer):
                 # Initialize State
                 if "t" not in state:
                     state["t"] = 1
-                    state["m"] = torch.zeros(grad.shape, device=device, dtype=dtype)
-                    state["v"] = torch.zeros(grad.shape, device=device, dtype=dtype)
+                    state["m"] = torch.zeros(grad.shape, device=p.device, dtype=p.dtype)
+                    state["v"] = torch.zeros(grad.shape, device=p.device, dtype=p.dtype)
                 
                 t = state["t"]   
                 m = state["m"]

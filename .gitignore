@@ -4,6 +4,7 @@ test_results.xml
 
 memory_profiling/
 profiling/
+ddp_profile/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

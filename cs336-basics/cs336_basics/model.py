@@ -6,6 +6,7 @@ from torch.utils.checkpoint import checkpoint
 from torch import Tensor
 from jaxtyping import Bool, Float, Int
 from cs336_basics.layers import Linear, Embedding, silu, scaled_dot_product_attention, RotaryPositionalEmbedding, RMSNorm
+from cs336_systems.flash_attention import FlashAttentionTriton
 
 
 class SiLU(nn.Module):
@@ -73,9 +74,16 @@ class MultiHeadSelfAttention(nn.Module):
         V = qkv[2]
         
         # We want to apply QK normalization
-        Q = self.layer_norm(Q)
-        K = self.layer_norm(K)
-        attn = scaled_dot_product_attention(Q, K, V, mask=mask, cap_logits=self.cap_logits)
+        B = Q.shape[0]
+        S = Q.shape[-2]
+
+        Q_flash = Q.reshape(B * self.h, S, self.d_k)
+        K_flash = K.reshape(B * self.h, S, self.d_k)
+        V_flash = V.reshape(B * self.h, S, self.d_k)
+
+        attn = FlashAttentionTriton.apply(Q_flash, K_flash, V_flash, True)
+
+        attn = attn.reshape(B, self.h, S, self.d_k)
         
         # Concatenate the heads
         attn = einx.id("... h sequence_length d_v -> ... sequence_length (h d_v)", attn, h=self.h)
@@ -121,63 +129,6 @@ class TransformerBlock(nn.Module):
         return z + self.ffn(self.ln2(z))
     
     
-class TransformerLM(nn.Module):
-    """Full Model"""
-    def __init__(self, vocab_size: int, context_length: int,
-                d_model: int, num_layers: int, num_heads: int, rope_theta: float=10000, use_rope=True,
-                norm_style="pre", ffn_type="swiglu", use_qk_norm=False, cap_logits=False, add_embedding_residual=False,
-                d_ff: int | None=None, device=None, dtype=None
-                ):
-        super().__init__()
-        
-        if d_ff is None and ffn_type == "swiglu":
-            d_ff = round(8/3 * d_model / 64) * 64
-        elif d_ff is None and ffn_type == "silu":
-            d_ff = round(4 * d_model / 64) * 64
-        
-        self.cap_logits = cap_logits
-        self.add_embedding_residual = add_embedding_residual
-        
-        self.token_embeddings = Embedding(num_embeddings=vocab_size, embedding_dim=d_model, device=device, dtype=dtype)
-        self.layers = nn.ModuleList([TransformerBlock(d_model=d_model,
-                                                         num_heads=num_heads,
-                                                         d_ff=d_ff,
-                                                         max_seq_len=context_length,
-                                                         rope_theta=rope_theta,
-                                                         use_rope=use_rope,
-                                                         norm_type=norm_style,
-                                                         use_qk_norm=use_qk_norm,
-                                                         cap_logits=cap_logits,
-                                                         ffn_type=ffn_type,
-                                                         device=device,
-                                                         dtype=dtype) for _ in range(num_layers)])
-        self.ln_final = RMSNorm(d_model=d_model, device=device, dtype=dtype)
-        self.lm_head = Linear(in_features=d_model, out_features=vocab_size, zero_init=False, device=device, dtype=dtype)
-        
-    def forward(self, input: Int[Tensor, " batch_size sequence_length"], checkpoint_k=1) ->  Float[Tensor, " batch_size sequence_length vocab_size"]:
-        """k is used for gradient checkpointing """
-        
-        
-        # Initial Embeddings
-        initial_embeddings = self.token_embeddings(input)
-        x = initial_embeddings
-        
-        B, S = input.shape
-        # We will reuse these for every layer
-        token_positions = torch.arange(S, device=input.device)
-        mask = torch.tril(torch.ones(S, S, device=input.device, dtype=torch.bool))
-        
-        # Helper function to wrap a chunk of layers
-        for layer in self.layers:
-            x = layer(x, mask=mask, token_positions=token_positions)
-            
-        # Get final logits
-        x = self.ln_final(x)
-        logits = self.lm_head(x)
-        return logits
-    
-
-# This was for checkpointing --> Will bring it back if needed
 # class TransformerLM(nn.Module):
 #     """Full Model"""
 #     def __init__(self, vocab_size: int, context_length: int,
@@ -225,21 +176,77 @@ class TransformerLM(nn.Module):
 #         mask = torch.tril(torch.ones(S, S, device=input.device, dtype=torch.bool))
         
 #         # Helper function to wrap a chunk of layers
-#         def run_layer_chunk(chunk_x, *layers):
-#             for layer in layers:
-#                 chunk_x = layer(chunk_x, mask=mask, token_positions=token_positions)
-#             return chunk_x
-        
-#         # Apply checkpointing in chunks of k
-#         for i in range(0, len(self.layers), checkpoint_k):
-#             layer_chunk = self.layers[i : i + checkpoint_k]
-            
-#             if checkpoint_k >= 1 and self.training:
-#                 x = checkpoint(run_layer_chunk, x, *layer_chunk, use_reentrant=True)
-#             else:
-#                 x = run_layer_chunk(x, *layer_chunk)
+#         for layer in self.layers:
+#             x = layer(x, mask=mask, token_positions=token_positions)
             
 #         # Get final logits
 #         x = self.ln_final(x)
 #         logits = self.lm_head(x)
 #         return logits
+    
+
+class TransformerLM(nn.Module):
+    """Full Model"""
+    def __init__(self, vocab_size: int, context_length: int,
+                d_model: int, num_layers: int, num_heads: int, rope_theta: float=10000, use_rope=True,
+                norm_style="pre", ffn_type="swiglu", use_qk_norm=False, cap_logits=False, add_embedding_residual=False,
+                d_ff: int | None=None, device=None, dtype=None
+                ):
+        super().__init__()
+        
+        if d_ff is None and ffn_type == "swiglu":
+            d_ff = round(8/3 * d_model / 64) * 64
+        elif d_ff is None and ffn_type == "silu":
+            d_ff = round(4 * d_model / 64) * 64
+        
+        self.cap_logits = cap_logits
+        self.add_embedding_residual = add_embedding_residual
+        
+        self.token_embeddings = Embedding(num_embeddings=vocab_size, embedding_dim=d_model, device=device, dtype=dtype)
+        self.layers = nn.ModuleList([TransformerBlock(d_model=d_model,
+                                                         num_heads=num_heads,
+                                                         d_ff=d_ff,
+                                                         max_seq_len=context_length,
+                                                         rope_theta=rope_theta,
+                                                         use_rope=use_rope,
+                                                         norm_type=norm_style,
+                                                         use_qk_norm=use_qk_norm,
+                                                         cap_logits=cap_logits,
+                                                         ffn_type=ffn_type,
+                                                         device=device,
+                                                         dtype=dtype) for _ in range(num_layers)])
+        self.ln_final = RMSNorm(d_model=d_model, device=device, dtype=dtype)
+        self.lm_head = Linear(in_features=d_model, out_features=vocab_size, zero_init=False, device=device, dtype=dtype)
+        
+    def forward(self, input: Int[Tensor, " batch_size sequence_length"], checkpoint_k=1) ->  Float[Tensor, " batch_size sequence_length vocab_size"]:
+        """k is used for gradient checkpointing """
+        
+        
+        # Initial Embeddings
+        initial_embeddings = self.token_embeddings(input)
+        x = initial_embeddings
+        
+        B, S = input.shape
+        # We will reuse these for every layer
+        token_positions = torch.arange(S, device=input.device)
+        mask = torch.tril(torch.ones(S, S, device=input.device, dtype=torch.bool))
+        
+        # Helper function to wrap a chunk of layers
+        def run_layer_chunk(chunk_x, *layers):
+            for layer in layers:
+                chunk_x = layer(chunk_x, mask=mask, token_positions=token_positions)
+            return chunk_x
+        
+        # Apply checkpointing in chunks of k
+        for i in range(0, len(self.layers), checkpoint_k):
+            layer_chunk = self.layers[i : i + checkpoint_k]
+            
+            if checkpoint_k >= 1 and self.training:
+                x = checkpoint(run_layer_chunk, x, *layer_chunk, use_reentrant=True)
+            else:
+                x = run_layer_chunk(x, *layer_chunk)
+            
+        # Get final logits
+        x = self.ln_final(x)
+        logits = self.lm_head(x)
+        return logits

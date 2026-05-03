@@ -14,6 +14,7 @@ from jaxtyping import Bool, Float, Int
 from torch import Tensor
 
 from cs336_basics.nn_utils import softmax
+from cs336_systems.flash_attention import FlashAttentionTriton
 
 logger = logging.getLogger(__name__)
 
@@ -509,21 +510,14 @@ class CausalMultiHeadSelfAttention(nn.Module):
             Q = self.positional_encoder(Q, token_positions)
             K = self.positional_encoder(K, token_positions)
 
-        # Construct causal mask
-        iota = torch.arange(sequence_length, device=x.device)
-        qi = rearrange(iota, "query -> query 1")
-        kj = rearrange(iota, "key   -> 1   key")
-        causal_mask = qi >= kj  # (query, key)
-        causal_mask = causal_mask.__getitem__((None,) * len(batch_dims) + (...,))  # Add appropriate leading dimensions
+        Q_flash = Q.reshape(-1, sequence_length, self.d_k)
+        K_flash = K.reshape(-1, sequence_length, self.d_k)
+        V_flash = V.reshape(-1, sequence_length, self.d_v)
 
-        # Shape: (..., num_heads, sequence_length, d_k)
-        attn_output = scaled_dot_product_attention(K=K, Q=Q, V=V, mask=causal_mask)
+        attn_output = FlashAttentionTriton.apply(Q_flash, K_flash, V_flash, True)
+        attn_output = attn_output.reshape(*batch_dims, self.num_heads, sequence_length, self.d_v)
+        attn_output = rearrange(attn_output, "... heads seq d_v -> ... seq (heads d_v)")
 
-        # Concatenate the attention output from all heads.
-        # (..., sequence_length, num_heads * d_v).
-        attn_output = rearrange(attn_output, "batch heads seq d_v -> batch seq (heads d_v)").contiguous()
-
-        # Apply the output projection
         output = self.output_proj(attn_output)
         return output
 
