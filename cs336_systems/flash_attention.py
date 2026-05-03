@@ -83,17 +83,41 @@ def flash_fwd_kernel(
     Q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero") # (Q_TILE_SIZE, D)
     
     q_indices = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+
     
-    for i in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+    if is_causal:
+        limit = (query_tile_index * Q_TILE_SIZE) // K_TILE_SIZE
+        
+        # 1. Unmasked blocks
+        for i in range(0, limit):
+            K = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
+            V = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
+            
+            S = tl.dot(Q, tl.trans(K)) * scale # (Q_TILE_SIZE, K_TILE_SIZE)
+            
+            rowmax = tl.max(S, axis=1)                          # (Q_TILE_SIZE,)
+            m_new = tl.maximum(M, rowmax)                       # (Q_TILE_SIZE,)
+            
+            P = tl.exp(S - m_new[:, None])                      # (Q_TILE_SIZE, K_TILE_SIZE)
+            correction_factor = tl.exp(M - m_new)               # (Q_TILE_SIZE,)
+            L = correction_factor * L + tl.sum(P, axis=1)       # (Q_TILE_SIZE,)
+            O = correction_factor[:, None] * O
+            O = tl.dot(P.to(V.dtype), V, acc=O)                 # (Q_TILE_SIZE, D)
+            
+            M = m_new
+            K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+            V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+            
+        # 2. Diagonal block 
         K = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
         V = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
         
         S = tl.dot(Q, tl.trans(K)) * scale # (Q_TILE_SIZE, K_TILE_SIZE)
         
-        if is_causal:
-            k_indices = i * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
-            mask = q_indices[:, None] < k_indices[None, :]  # (Q_TILE_SIZE, K_TILE_SIZE)
-            S = tl.where(mask, S + -1e6, S)
+        k_indices = limit * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+        mask = q_indices[:, None] < k_indices[None, :]  # (Q_TILE_SIZE, K_TILE_SIZE)
+        S = tl.where(mask, S + -1e6, S)
+        
         rowmax = tl.max(S, axis=1)                          # (Q_TILE_SIZE,)
         m_new = tl.maximum(M, rowmax)                       # (Q_TILE_SIZE,)
         
@@ -104,8 +128,26 @@ def flash_fwd_kernel(
         O = tl.dot(P.to(V.dtype), V, acc=O)                 # (Q_TILE_SIZE, D)
         
         M = m_new
-        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
-        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+
+    else:
+        for i in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+            K = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
+            V = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
+            
+            S = tl.dot(Q, tl.trans(K)) * scale # (Q_TILE_SIZE, K_TILE_SIZE)
+            
+            rowmax = tl.max(S, axis=1)                          # (Q_TILE_SIZE,)
+            m_new = tl.maximum(M, rowmax)                       # (Q_TILE_SIZE,)
+            
+            P = tl.exp(S - m_new[:, None])                      # (Q_TILE_SIZE, K_TILE_SIZE)
+            correction_factor = tl.exp(M - m_new)               # (Q_TILE_SIZE,)
+            L = correction_factor * L + tl.sum(P, axis=1)       # (Q_TILE_SIZE,)
+            O = correction_factor[:, None] * O
+            O = tl.dot(P.to(V.dtype), V, acc=O)                 # (Q_TILE_SIZE, D)
+            
+            M = m_new
+            K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+            V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
     
     
     # Normalize the final output
@@ -228,18 +270,26 @@ def flash_bwd_dkdv_kernel(
     
     k_indices = key_tile_index * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
     
-    for i in range(tl.cdiv(N_QUERIES, Q_TILE_SIZE)):
+    if is_causal:
+        start = (key_tile_index * K_TILE_SIZE) // Q_TILE_SIZE
+        
+        # Advance pointers to skip "future" query blocks that were masked to -inf
+        Q_block_ptr = Q_block_ptr.advance((start * Q_TILE_SIZE, 0))
+        dO_block_ptr = dO_block_ptr.advance((start * Q_TILE_SIZE, 0))
+        L_block_ptr = L_block_ptr.advance((start * Q_TILE_SIZE,))
+        D_block_ptr = D_block_ptr.advance((start * Q_TILE_SIZE,))
+        
+        # 1. Diagonal block (Needs masking because query and key overlap)
         Q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")   # (Q_TILE_SIZE, D)
         dO = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero") # (Q_TILE_SIZE, D)
         L = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")     # (Q_TILE_SIZE)
-        Di = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")     # (Q_TILE_SIZE)
+        Di = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")    # (Q_TILE_SIZE)
         
-        q_indices = i * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+        q_indices = start * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
         
         S = tl.dot(Q, tl.trans(K)) * scale   # (Q_TILE_SIZE, K_TILE_SIZE)
-        if is_causal:
-            mask = q_indices[:, None] < k_indices[None, :]  # (Q_TILE_SIZE, K_TILE_SIZE)
-            S = tl.where(mask, S + -1e6, S)
+        mask = q_indices[:, None] < k_indices[None, :]  # (Q_TILE_SIZE, K_TILE_SIZE)
+        S = tl.where(mask, S + -1e6, S)
             
         P = tl.exp(S - L[:, None])                        # (Q_TILE_SIZE, K_TILE_SIZE)
         dV = tl.dot(tl.trans(P.to(dO.dtype)), dO, acc=dV) # (K_TILE_SIZE, D)
@@ -251,6 +301,46 @@ def flash_bwd_dkdv_kernel(
         dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE, 0))
         L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE,))
         D_block_ptr = D_block_ptr.advance((Q_TILE_SIZE,))
+        
+        # 2. Unmasked blocks (Valid past queries)
+        for i in range(start + 1, tl.cdiv(N_QUERIES, Q_TILE_SIZE)):
+            Q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")   # (Q_TILE_SIZE, D)
+            dO = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero") # (Q_TILE_SIZE, D)
+            L = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")     # (Q_TILE_SIZE)
+            Di = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")    # (Q_TILE_SIZE)
+            
+            S = tl.dot(Q, tl.trans(K)) * scale   # (Q_TILE_SIZE, K_TILE_SIZE)
+                
+            P = tl.exp(S - L[:, None])                        # (Q_TILE_SIZE, K_TILE_SIZE)
+            dV = tl.dot(tl.trans(P.to(dO.dtype)), dO, acc=dV) # (K_TILE_SIZE, D)
+            dP = tl.dot(dO, tl.trans(V))                      # (Q_TILE_SIZE, K_TILE_SIZE)
+            dS = P * (dP - Di[:, None])                       # (Q_TILE_SIZE, K_TILE_SIZE)
+            dK = tl.dot(tl.trans(dS), Q * scale, acc=dK)      # (K_TILE_SIZE, D)
+            
+            Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
+            dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE, 0))
+            L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE,))
+            D_block_ptr = D_block_ptr.advance((Q_TILE_SIZE,))
+
+    else:
+        for i in range(tl.cdiv(N_QUERIES, Q_TILE_SIZE)):
+            Q = tl.load(Q_block_ptr, boundary_check=(0, 1), padding_option="zero")   # (Q_TILE_SIZE, D)
+            dO = tl.load(dO_block_ptr, boundary_check=(0, 1), padding_option="zero") # (Q_TILE_SIZE, D)
+            L = tl.load(L_block_ptr, boundary_check=(0,), padding_option="zero")     # (Q_TILE_SIZE)
+            Di = tl.load(D_block_ptr, boundary_check=(0,), padding_option="zero")    # (Q_TILE_SIZE)
+            
+            S = tl.dot(Q, tl.trans(K)) * scale   # (Q_TILE_SIZE, K_TILE_SIZE)
+                
+            P = tl.exp(S - L[:, None])                        # (Q_TILE_SIZE, K_TILE_SIZE)
+            dV = tl.dot(tl.trans(P.to(dO.dtype)), dO, acc=dV) # (K_TILE_SIZE, D)
+            dP = tl.dot(dO, tl.trans(V))                      # (Q_TILE_SIZE, K_TILE_SIZE)
+            dS = P * (dP - Di[:, None])                       # (Q_TILE_SIZE, K_TILE_SIZE)
+            dK = tl.dot(tl.trans(dS), Q * scale, acc=dK)      # (K_TILE_SIZE, D)
+            
+            Q_block_ptr = Q_block_ptr.advance((Q_TILE_SIZE, 0))
+            dO_block_ptr = dO_block_ptr.advance((Q_TILE_SIZE, 0))
+            L_block_ptr = L_block_ptr.advance((Q_TILE_SIZE,))
+            D_block_ptr = D_block_ptr.advance((Q_TILE_SIZE,))
         
         
     # Write the final outputs
@@ -363,25 +453,54 @@ def flash_bwd_dq_kernel(
     dQ = tl.zeros((Q_TILE_SIZE, D), dtype=tl.float32)
     
     q_indices = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
-    for i in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+    
+    if is_causal:
+        limit = (query_tile_index * Q_TILE_SIZE) // K_TILE_SIZE
+        
+        # 1. Unmasked blocks
+        for i in range(0, limit):
+            K = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
+            V = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
+            
+            S = tl.dot(Q, tl.trans(K)) * scale # (Q_TILE_SIZE, K_TILE_SIZE)
+            
+            P = tl.exp(S - L[:, None])                    # (Q_TILE_SIZE, K_TILE_SIZE)
+            dP = tl.dot(dO, tl.trans(V))                  # (Q_TILE_SIZE, K_TILE_SIZE)
+            dS = P * (dP - Di[:, None])                   # (Q_TILE_SIZE, K_TILE_SIZE)
+            dQ = tl.dot(dS, K * scale, acc=dQ)
+            
+            K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+            V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+            
+        # 2. Diagonal block
         K = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
         V = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
         
         S = tl.dot(Q, tl.trans(K)) * scale # (Q_TILE_SIZE, K_TILE_SIZE)
         
-        if is_causal:
-            k_indices = i * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
-            mask = q_indices[:, None] < k_indices[None, :]  # (Q_TILE_SIZE, K_TILE_SIZE)
-            S = tl.where(mask, S + -1e6, S)
-            
+        k_indices = limit * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+        mask = q_indices[:, None] < k_indices[None, :]  # (Q_TILE_SIZE, K_TILE_SIZE)
+        S = tl.where(mask, S + -1e6, S)
             
         P = tl.exp(S - L[:, None])                    # (Q_TILE_SIZE, K_TILE_SIZE)
         dP = tl.dot(dO, tl.trans(V))                  # (Q_TILE_SIZE, K_TILE_SIZE)
         dS = P * (dP - Di[:, None])                   # (Q_TILE_SIZE, K_TILE_SIZE)
         dQ = tl.dot(dS, K * scale, acc=dQ)
-        
-        K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
-        V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
+
+    else:
+        for i in range(tl.cdiv(N_KEYS, K_TILE_SIZE)):
+            K = tl.load(K_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
+            V = tl.load(V_block_ptr, boundary_check=(0, 1), padding_option="zero") # (K_TILE_SIZE, D)
+            
+            S = tl.dot(Q, tl.trans(K)) * scale # (Q_TILE_SIZE, K_TILE_SIZE)
+            
+            P = tl.exp(S - L[:, None])                    # (Q_TILE_SIZE, K_TILE_SIZE)
+            dP = tl.dot(dO, tl.trans(V))                  # (Q_TILE_SIZE, K_TILE_SIZE)
+            dS = P * (dP - Di[:, None])                   # (Q_TILE_SIZE, K_TILE_SIZE)
+            dQ = tl.dot(dS, K * scale, acc=dQ)
+            
+            K_block_ptr = K_block_ptr.advance((K_TILE_SIZE, 0))
+            V_block_ptr = V_block_ptr.advance((K_TILE_SIZE, 0))
         
         
     dQ_dtype = dQ_block_ptr.type.element_ty
